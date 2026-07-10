@@ -393,8 +393,9 @@ def _apply_osm_nonburnable_override(bg_image, fuel_model, grid_w, grid_h):
     # Water: blue clearly dominant
     water = (B > R + 15) & (B > G + 8) & (B > 120)
 
-    # Urban/built: all channels high, not strongly green
-    urban = (~water) & (R > 175) & (G > 175) & (B > 155) & ((G - R) < 20)
+    # Urban/built: grey/asphalt — all channels high and similar (low saturation)
+    # Exclude beige/limestone (high R, lower B) and vegetation
+    urban = (~water) & (R > 175) & (G > 175) & (B > 155) & ((G - R) < 15) & ((R - B) < 25)
 
     # Roads (OSM renders major roads as salmon/pink/orange):
     # R is highest, G moderate, B lower

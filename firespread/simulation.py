@@ -25,6 +25,8 @@ BURNING = 1
 BURNED  = 2
 
 
+
+
 def ros_to_prob_seconds(ros_m_min, cell_size_m, dt_seconds):
     """
     Convert Rothermel ROS (m/min) to ignition probability for a timestep
@@ -129,7 +131,8 @@ class FireSimulation:
                     # za column dobijemo indexerror i crasha
                     if self.grid[ny][nx] != EMPTY:
                         continue
-                    # bez ovog, burned susjed ce opet pokrenut rothermela i potencijalno opet postat burning
+                    # bez ovog, burned susjed ce opet pokrenut rothermela i potencijalno opet postat burning, 
+                    # a i nema smisla zvat opet rothermela za ćeliju koja vec gori 
 
                     ros = rate_of_spread(
                         fuel_id        = str(self.fuel_model[ny, nx]),
@@ -142,7 +145,7 @@ class FireSimulation:
                     )
                     # pozivanje rothermel funkcije, koristimo susjednu celiju jer ona odlucuje oce li se vatra sirit
 
-                    # Diagonal cells are √2 farther away
+                    # Dijagonalne celije su udaljene sqrt(2) puta vise
                     dist = self.cell_size_m * (math.sqrt(2) if dx != 0 and dy != 0 else 1.0)
                     prob = ros_to_prob_seconds(ros, dist, dt_seconds)
                     # izracuna se vjerojatnost oce li se prosirit ili ne
@@ -160,6 +163,9 @@ class FireSimulation:
     # ------------------------------------------------------------------
     # Time helpers
     # ------------------------------------------------------------------
+
+    # moglo je i bez property
+
 
     @property
     def elapsed_minutes(self):

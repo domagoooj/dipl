@@ -7,8 +7,8 @@ from simulation import FireSimulation, EMPTY, BURNING, BURNED
 from data_fetcher import fetch_all, MapData
 from slippy_map import SlippyMap
 
-MAP_W = 960
-MAP_H = 960
+MAP_W = 640
+MAP_H = 640
 
 GRID_W = 120
 GRID_H = 120
@@ -28,7 +28,9 @@ class OverviewFrame(tk.Frame):
     def __init__(self, parent, on_bbox_selected):
         super().__init__(parent, bg="#1a1a2e")
         self.on_bbox_selected = on_bbox_selected
-        # callback funkcija koja se zove kad korisnik oznaci mapu, definira u App(), triggera loadanje
+        # callback funkcija koja se zove kad korisnik oznaci mapu, 
+        #definirana u App() klasi, triggera loadanje
+        
         self._build()
         # zove funkciju koja napravi widgete aplikacije
 
@@ -123,7 +125,7 @@ class SimFrame(tk.Frame):
         )
         self.paused = True
         self.speed_ms = 1000          # always 1 real second between ticks
-        self.speed_factor = 60.0      # simulated seconds per real second (default 1 min/s)
+        self.steps_per_tick = 1       # how many 60-second steps per real second
         self._bg_photo = None
         self._fire_photo = None
         self._tick_id = None
@@ -133,7 +135,6 @@ class SimFrame(tk.Frame):
 
     def _build(self):
         cw, ch = GRID_W * CELL, GRID_H * CELL
-
         self.canvas = tk.Canvas(self, width=cw, height=ch,
                                 bg="#228B22", highlightthickness=0, cursor="crosshair")
         self.canvas.pack()
@@ -146,7 +147,6 @@ class SimFrame(tk.Frame):
 
         ctrl = tk.Frame(self, bg="#333", pady=6)
         ctrl.pack(fill=tk.X)
-
         tk.Button(ctrl, text="← Back", width=8, command=self._back).pack(side=tk.LEFT, padx=6)
         self.btn_pause = tk.Button(ctrl, text="Play", width=8, command=self._toggle_pause)
         self.btn_pause.pack(side=tk.LEFT, padx=2)
@@ -164,7 +164,6 @@ class SimFrame(tk.Frame):
         self.time_label = tk.Label(ctrl, text="⏱ 0s", bg="#333",
                                    fg="#88ff88", font=("Segoe UI", 10))
         self.time_label.pack(side=tk.LEFT, padx=(14, 2))
-
         # Weather / cell info on the right
         md = self.map_data
         w = md.weather
@@ -173,6 +172,7 @@ class SimFrame(tk.Frame):
                 f"FM: {w['fuel_moisture']*100:.1f}%  |  "
                 f"Cell: {md.cell_size_m:.0f} m  |  Click to ignite")
         tk.Label(ctrl, text=info, bg="#333", fg="#aaa").pack(side=tk.RIGHT, padx=10)
+
     def _draw_background(self):
         cw, ch = GRID_W * CELL, GRID_H * CELL
         # background_image is already stored at canvas resolution (grid*CELL)
@@ -207,37 +207,34 @@ class SimFrame(tk.Frame):
         self.on_back()
 
     def _slower(self):
-        # Speed steps: 1s, 5s, 10s, 30s, 1m, 5m, 10m, 30m, 1h, 6h
-        steps = [1, 5, 10, 30, 60, 300, 600, 1800, 3600, 21600]
-        idx = next((i for i, s in enumerate(steps) if s >= self.speed_factor), len(steps)-1)
-        self.speed_factor = steps[max(0, idx - 1)]
+        steps = [1, 2, 5, 10, 30, 60]
+        idx = next((i for i, s in enumerate(steps) if s >= self.steps_per_tick), len(steps)-1)
+        self.steps_per_tick = steps[max(0, idx - 1)]
         self.speed_label.config(text=self._speed_text())
 
     def _faster(self):
-        steps = [1, 5, 10, 30, 60, 300, 600, 1800, 3600, 21600]
-        idx = next((i for i, s in enumerate(steps) if s >= self.speed_factor), 0)
-        self.speed_factor = steps[min(len(steps)-1, idx + 1)]
+        steps = [1, 2, 5, 10, 30, 60]
+        idx = next((i for i, s in enumerate(steps) if s >= self.steps_per_tick), 0)
+        self.steps_per_tick = steps[min(len(steps)-1, idx + 1)]
         self.speed_label.config(text=self._speed_text())
 
     def _speed_text(self):
-        s = self.speed_factor
-        if s < 60:
-            return f"×{s:.0f} (1s/s)"
-        elif s < 3600:
-            return f"×{s:.0f} ({s/60:.0f}m/s)"
+        mins = self.steps_per_tick
+        if mins < 60:
+            return f"{mins} min/s"
         else:
-            return f"×{s:.0f} ({s/3600:.0f}h/s)"
+            return f"{mins//60} h/s"
 
     def _tick(self):
         if not self.paused:
-            # Advance simulation by speed_factor simulated seconds
-            self.sim.step(dt_seconds=self.speed_factor)
+            for _ in range(self.steps_per_tick):
+                self.sim.step(dt_seconds=60)
+                if not self.sim.running:
+                    break
             self._redraw_fire()
-            # Update elapsed time display
             self.time_label.config(text=f"⏱ {self.sim.elapsed_str()}")
             if not self.sim.running:
                 print("[tick] simulation stopped (no burning cells)")
-        # Always reschedule every 1 real second
         self._tick_id = self.after(1000, self._tick)
 
     def _redraw_fire(self):
