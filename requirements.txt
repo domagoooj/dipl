@@ -1,0 +1,6 @@
+numpy==2.4.3
+Pillow==12.1.1
+requests==2.33.0
+rasterio==1.5.0
+sentinelhub==3.11.5
+reportlab==4.4.10
