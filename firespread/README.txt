@@ -18,10 +18,15 @@ Run
 
 Controls
 --------
+The whole app is one resizable window: an always-on slippy map with the fire
+simulation drawn as a live overlay on the terrain. No area-selection step.
+
 - Drag map to pan
 - Scroll wheel to zoom
-- Shift + drag to select simulation area
-- Click on the loaded map to ignite fire
+- Resize the window freely
+- "🔥 Ignite" button: arm ignite mode, then click the map to start a fire
+  (the simulation area is captured automatically from the current view the
+   first time you ignite; press Reset to relocate it)
 - Speed +/- to control how fast simulated time passes
 - Play/Pause and Reset buttons
 

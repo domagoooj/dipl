@@ -5,7 +5,7 @@ Uses FireSimulation and rate_of_spread exactly as the original files define them
 No GUI — prints a text grid to the terminal each tick and a summary at the end.
 
 Run:
-    python run_simulation.py
+    python run__simulation.py
 
 Requires:
     rothermel.py and simulation.py in the same directory.
@@ -26,10 +26,12 @@ from rothermel import FUEL_MODELS, NEIGHBOR_DIRS, rate_of_spread
 DEFAULT_FUEL = "GR2"
 
 # ---------------------------------------------------------------------------
-# Grid size — same constants as ui.py
+# Grid size — kept small so the ASCII grid fits in a terminal window.
+# (The GUI app sizes its grid dynamically from the map viewport; this demo
+#  simply uses a fixed small grid.)
 # ---------------------------------------------------------------------------
-GRID_W = 40    # narrowed from ui.py's 120 so the terminal output fits
-GRID_H = 30    # narrowed from ui.py's 90
+GRID_W = 40    # cells across (small enough for terminal output)
+GRID_H = 30    # cells down
 
 # ---------------------------------------------------------------------------
 # Simulation scenario — tweak these to experiment
@@ -49,7 +51,7 @@ FUEL_MOISTURE = 0.08   # self.fuel_moisture default value
 # Cell size in metres — same default as FireSimulation.__init__
 CELL_SIZE_M = 100.0    # self.cell_size_m
 
-# Speed: each step = 60 simulated seconds (matches ui.py default speed_factor=60)
+# Speed: each step advances 60 simulated seconds (the same 60 s step the GUI uses)
 DT_SECONDS = 60.0
 
 # How many steps to run
@@ -119,7 +121,7 @@ for (dy, dx), bearing in NEIGHBOR_DIRS.items():
 print()
 
 # ---------------------------------------------------------------------------
-# Initialise simulation — mirrors SimFrame._build() in ui.py
+# Initialise simulation — same setup the GUI performs in App._region_ready()
 # ---------------------------------------------------------------------------
 sim = FireSimulation(GRID_W, GRID_H)
 
@@ -134,14 +136,14 @@ sim.load_environment(
     cell_size_m   = CELL_SIZE_M,
 )
 
-# ignite() — same call as SimFrame._on_click() in ui.py
+# ignite() — same call the GUI makes from App._ignite_at()
 sim.ignite(IGNITE_X, IGNITE_Y)
 
 # ---------------------------------------------------------------------------
 # ASCII display helpers
 # ---------------------------------------------------------------------------
 
-# Cell characters — matches FIRE_COLORS keys in ui.py
+# Cell characters — one per simulation state (EMPTY / BURNING / BURNED)
 CELL_CHAR = {
     EMPTY:   ".",    # unburned
     BURNING: "#",    # actively burning
@@ -163,13 +165,13 @@ def print_grid(sim, step):
     print("+" + "-" * sim.width + "+")
 
 # ---------------------------------------------------------------------------
-# Main simulation loop — mirrors SimFrame._tick() in ui.py
+# Main simulation loop — mirrors the GUI's animation loop (App._tick())
 # ---------------------------------------------------------------------------
 
 print_grid(sim, step=0)
 
 for step in range(1, MAX_STEPS + 1):
-    # sim.step(dt_seconds) — same call as _tick() makes with speed_factor
+    # sim.step(dt_seconds) — the same call the GUI's _tick() makes each step
     sim.step(dt_seconds=DT_SECONDS)
 
     print_grid(sim, step)

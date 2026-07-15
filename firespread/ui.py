@@ -1,299 +1,435 @@
+"""
+Single-view fire spread UI.
+
+The whole app is one resizable window: a slippy OpenStreetMap map that is always
+visible, with the live fire simulation drawn as a translucent overlay glued to
+the terrain. There is no area-selection step and no screen switching.
+
+Interaction
+-----------
+- Drag            : pan the map
+- Scroll wheel    : zoom
+- "Ignite"        : arm ignite mode, then click the map to start a fire
+- Bottom toolbar  : Play/Pause, Reset, Speed, elapsed time, weather/status
+
+The simulation region is captured automatically from the current viewport the
+first time you ignite (or after Reset), so you simply zoom to an area and light
+it up. The fire is geo-anchored: it stays put on the map while you pan and zoom.
+"""
+
+import math
+import threading
+
 import tkinter as tk
 from tkinter import messagebox
-import threading
 from PIL import Image, ImageTk
+import numpy as np
 
 from simulation import FireSimulation, EMPTY, BURNING, BURNED
-from data_fetcher import fetch_all, MapData
+from data_fetcher import fetch_all
 from slippy_map import SlippyMap
 
-MAP_W = 640
-MAP_H = 640
-
-GRID_W = 120
-GRID_H = 120
-CELL = 8
-
-FIRE_COLORS = {
-    BURNING: (255, 80, 0),
-    BURNED:  (40, 40, 40),
+FIRE_RGBA = {
+    BURNING: (255, 80, 0, 235),
+    BURNED:  (40, 40, 40, 205),
 }
 
+TARGET_CELL_M = 30.0   
+MIN_CELLS = 24
+MAX_CELLS = 220
 
-# ---------------------------------------------------------------------------
-# Stage 1: Pannable/zoomable overview with Shift+drag bbox selection
-# ---------------------------------------------------------------------------
-
-class OverviewFrame(tk.Frame):
-    def __init__(self, parent, on_bbox_selected):
-        super().__init__(parent, bg="#1a1a2e")
-        self.on_bbox_selected = on_bbox_selected
-        # callback funkcija koja se zove kad korisnik oznaci mapu, 
-        #definirana u App() klasi, triggera loadanje
-        
-        self._build()
-        # zove funkciju koja napravi widgete aplikacije
-
-    def _build(self):
-        # Status bar
-        bar = tk.Frame(self, bg="#222")
-        bar.pack(fill=tk.X)
-        # stretcha je cilon duzinon
-        self._status = tk.Label(bar, text="Drag to pan  |  Scroll to zoom  |  Shift+drag to select simulation area",
-                                bg="#222", fg="#aaa", font=("Segoe UI", 10))
-        self._status.pack(side=tk.LEFT, padx=10, pady=4)
-        self._coords = tk.Label(bar, text="", bg="#222", fg="#888", font=("Segoe UI", 10))
-        self._coords.pack(side=tk.RIGHT, padx=10)
-
-        # Canvas
-        self.canvas = tk.Canvas(self, width=MAP_W, height=MAP_H,
-                                bg="#1a1a2e", highlightthickness=0)
-        self.canvas.pack()
-        self.canvas.bind("<Motion>", self._on_mouse_move)
-
-        # Slippy map
-        self.slippy = SlippyMap(self.canvas, MAP_W, MAP_H, lat=45.8, lon=15.97, zoom=10)
-        # Zagreb
-        self.slippy.on_bbox = self._on_bbox
-        self.slippy.on_status = lambda s: self._status.config(text=s)
-
-    def _on_mouse_move(self, event):
-        lat, lon = self.slippy._canvas_to_latlon(event.x, event.y)
-        self._coords.config(text=f"{lat:.5f}, {lon:.5f}")
-
-    def _on_bbox(self, west, south, east, north):
-        self.on_bbox_selected(west, south, east, north)
+SPEED_STEPS = [1, 2, 5, 10, 30, 60]
 
 
 # ---------------------------------------------------------------------------
-# Loading screen
+# Fire overlay — draws the simulation grid on top of the slippy map
 # ---------------------------------------------------------------------------
 
-class LoadingFrame(tk.Frame):
-    def __init__(self, parent, bbox, on_done, on_error):
-        super().__init__(parent, bg="#1a1a2e", width=MAP_W, height=MAP_H + 30)
-        self.pack_propagate(False)
+class FireOverlay:
+    """
+    Renders the fire grid as a translucent RGBA image reprojected onto the
+    slippy map. Content is rebuilt only when the simulation changes; on pan /
+    zoom / resize the cached image is just re-placed and clipped to the canvas.
+    """
+
+    def __init__(self, canvas, slippy):
+        self.canvas = canvas
+        self.slippy = slippy
+        self.bbox = None          # (west, south, east, north) of the sim region
+        self._src = None          # PIL RGBA image at grid resolution
+        self._photo = None
+        self._item = None         # canvas image item
+        self._border = None       # canvas rectangle showing region bounds
+
+    def set_region(self, bbox):
         self.bbox = bbox
-        self.on_done = on_done
-        self.on_error = on_error
+
+    def clear(self):
+        self.bbox = None
+        self._src = None
+        self._photo = None
+        if self._item is not None:
+            self.canvas.delete(self._item)
+            self._item = None
+        if self._border is not None:
+            self.canvas.delete(self._border)
+            self._border = None
+
+    def refresh_content(self, sim):
+        """Rebuild the RGBA grid image from the simulation state, then redraw."""
+        grid = np.asarray(sim.grid, dtype=np.uint8)          # (H, W)
+        h, w = grid.shape
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[grid == BURNING] = FIRE_RGBA[BURNING]
+        rgba[grid == BURNED] = FIRE_RGBA[BURNED]
+        self._src = Image.fromarray(rgba, mode="RGBA")
+        self.redraw()
+
+    def redraw(self):
+        """Reproject the cached grid image onto the current map view."""
+        if self.bbox is None:
+            return
+
+        west, south, east, north = self.bbox
+        # Region corners in canvas pixels (NW -> top-left, SE -> bottom-right)
+        x0, y0 = self.slippy.latlon_to_canvas(north, west)
+        x1, y1 = self.slippy.latlon_to_canvas(south, east)
+        rx0, ry0 = min(x0, x1), min(y0, y1)
+        rx1, ry1 = max(x0, x1), max(y0, y1)
+
+        self._draw_border(rx0, ry0, rx1, ry1)
+
+        if self._src is None:
+            return
+        rect_w = rx1 - rx0
+        rect_h = ry1 - ry0
+        if rect_w < 1 or rect_h < 1:
+            self._hide_item()
+            return
+
+        # Clip the region rectangle to the visible canvas so we never build an
+        # image larger than the screen (keeps panning smooth at any zoom).
+        cw, ch = self.slippy.width, self.slippy.height
+        vx0, vy0 = max(0.0, rx0), max(0.0, ry0)
+        vx1, vy1 = min(cw, rx1), min(ch, ry1)
+        if vx1 - vx0 < 1 or vy1 - vy0 < 1:
+            self._hide_item()
+            return
+
+        # Corresponding crop box in the source (grid-resolution) image.
+        sw, sh = self._src.size
+        cx0 = int((vx0 - rx0) / rect_w * sw)
+        cy0 = int((vy0 - ry0) / rect_h * sh)
+        cx1 = max(cx0 + 1, int(math.ceil((vx1 - rx0) / rect_w * sw)))
+        cy1 = max(cy0 + 1, int(math.ceil((vy1 - ry0) / rect_h * sh)))
+        crop = self._src.crop((cx0, cy0, min(cx1, sw), min(cy1, sh)))
+
+        out_w = max(1, int(round(vx1 - vx0)))
+        out_h = max(1, int(round(vy1 - vy0)))
+        disp = crop.resize((out_w, out_h), Image.NEAREST)
+
+        self._photo = ImageTk.PhotoImage(disp)
+        if self._item is None:
+            self._item = self.canvas.create_image(
+                int(round(vx0)), int(round(vy0)), anchor="nw", image=self._photo)
+        else:
+            self.canvas.coords(self._item, int(round(vx0)), int(round(vy0)))
+            self.canvas.itemconfigure(self._item, image=self._photo, state="normal")
+        self.canvas.tag_raise(self._item)
+        if self._border is not None:
+            self.canvas.tag_raise(self._border)
+
+    def _draw_border(self, rx0, ry0, rx1, ry1):
+        coords = (rx0, ry0, rx1, ry1)
+        if self._border is None:
+            self._border = self.canvas.create_rectangle(
+                *coords, outline="#FF8C00", width=2, dash=(6, 4))
+        else:
+            self.canvas.coords(self._border, *coords)
+            self.canvas.tag_raise(self._border)
+
+    def _hide_item(self):
+        if self._item is not None:
+            self.canvas.itemconfigure(self._item, state="hidden")
+
+
+# ---------------------------------------------------------------------------
+# Root application — one window, one canvas, one bottom toolbar
+# ---------------------------------------------------------------------------
+
+class App(tk.Tk):
+    BAR_BG = "#2b2b3d"
+    BTN_BG = "#3d3d52"
+    IGNITE_ON = "#ff5522"
+
+    def __init__(self):
+        super().__init__()
+        self.title("Fire Spread Simulator")
+        self.geometry("960x720")
+        self.minsize(560, 420)
+
+        # Simulation state
+        self.sim = None
+        self.map_data = None
+        self.paused = True
+        self.steps_per_tick = 5
+        self.ignite_mode = False
+        self._loading = False
+        self._tick_id = None
+
         self._build()
-        self.after(100, self._fetch)
+        self._tick()
+
+    # ------------------------------------------------------------------
+    # Widget construction
+    # ------------------------------------------------------------------
 
     def _build(self):
-        w, s, e, n = self.bbox
-        tk.Label(self, text="Fetching map data...", bg="#1a1a2e", fg="white",
-                 font=("Segoe UI", 16, "bold")).pack(expand=True, pady=(120, 6))
-        tk.Label(self, text=f"N {n:.5f}   S {s:.5f}   W {w:.5f}   E {e:.5f}",
-                 bg="#1a1a2e", fg="#888", font=("Segoe UI", 10)).pack()
-        self._status = tk.Label(self, text="Downloading tiles...",
-                                bg="#1a1a2e", fg="#aaa", font=("Segoe UI", 10))
-        self._status.pack(pady=10)
+        # Bottom toolbar first so it reserves its height.
+        bar = tk.Frame(self, bg=self.BAR_BG)
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self._build_toolbar(bar)
 
-    def _fetch(self):
-        w, s, e, n = self.bbox
+        # Map canvas fills everything above the toolbar.
+        self.canvas = tk.Canvas(self, bg="#1a1a2e", highlightthickness=0,
+                                cursor="fleur")
+        self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.slippy = SlippyMap(self.canvas, 960, 660,
+                                lat=45.8, lon=15.97, zoom=11)
+        self.overlay = FireOverlay(self.canvas, self.slippy)
+
+        self.slippy.on_redraw = self.overlay.redraw
+        self.slippy.on_click = self._on_map_click
+        self.slippy.on_status = self._set_status
+
+        self.canvas.bind("<Configure>", self._on_resize)
+        self.canvas.bind("<Motion>", self._on_motion)
+
+        self._set_status("Arm 🔥 Ignite, then click the map to start a fire")
+
+    def _build_toolbar(self, bar):
+        def button(text, cmd, width=8):
+            return tk.Button(bar, text=text, width=width, command=cmd,
+                             bg=self.BTN_BG, fg="white", activebackground="#50506a",
+                             activeforeground="white", relief=tk.RAISED, bd=1,
+                             highlightthickness=0)
+
+        self.btn_ignite = button("🔥 Ignite", self._toggle_ignite, width=10)
+        self.btn_ignite.pack(side=tk.LEFT, padx=(8, 4), pady=6)
+
+        self.btn_pause = button("▶ Play", self._toggle_pause, width=8)
+        self.btn_pause.pack(side=tk.LEFT, padx=2, pady=6)
+
+        button("↺ Reset", self._reset).pack(side=tk.LEFT, padx=2, pady=6)
+
+        tk.Label(bar, text="Speed:", bg=self.BAR_BG, fg="#ccc").pack(
+            side=tk.LEFT, padx=(12, 2))
+        button("−", self._slower, width=2).pack(side=tk.LEFT)
+        self.speed_label = tk.Label(bar, text=self._speed_text(), width=8,
+                                    bg=self.BAR_BG, fg="white")
+        self.speed_label.pack(side=tk.LEFT)
+        button("+", self._faster, width=2).pack(side=tk.LEFT)
+
+        self.time_label = tk.Label(bar, text="⏱ 0s", bg=self.BAR_BG,
+                                   fg="#88ff88", font=("Segoe UI", 10))
+        self.time_label.pack(side=tk.LEFT, padx=(14, 6))
+
+        # Right side: coordinates + status/weather
+        self.coord_label = tk.Label(bar, text="", bg=self.BAR_BG, fg="#888")
+        self.coord_label.pack(side=tk.RIGHT, padx=10)
+        self.status_label = tk.Label(bar, text="", bg=self.BAR_BG, fg="#aaa")
+        self.status_label.pack(side=tk.RIGHT, padx=10)
+
+    # ------------------------------------------------------------------
+    # Map / canvas events
+    # ------------------------------------------------------------------
+
+    def _on_resize(self, event):
+        # Resizing the canvas resizes the map, which triggers overlay.redraw
+        # through the on_redraw hook.
+        self.slippy.resize(event.width, event.height)
+
+    def _on_motion(self, event):
+        lat, lon = self.slippy.canvas_to_latlon(event.x, event.y)
+        self.coord_label.config(text=f"{lat:.5f}, {lon:.5f}")
+
+    def _on_map_click(self, lat, lon):
+        if not self.ignite_mode or self._loading:
+            return
+        if self.sim is None:
+            # No active region yet: capture the current viewport and fetch data.
+            self._begin_region(lat, lon)
+        else:
+            self._ignite_at(lat, lon)
+
+    # ------------------------------------------------------------------
+    # Region setup (async data fetch)
+    # ------------------------------------------------------------------
+
+    def _viewport_bbox(self):
+        latN, lonW = self.slippy.canvas_to_latlon(0, 0)
+        latS, lonE = self.slippy.canvas_to_latlon(self.slippy.width,
+                                                  self.slippy.height)
+        west, east = min(lonW, lonE), max(lonW, lonE)
+        south, north = min(latN, latS), max(latN, latS)
+        return west, south, east, north
+
+    def _grid_dims(self, bbox):
+        # Choose the cell count so each cell is ~TARGET_CELL_M metres, regardless
+        # of zoom. Clamp to [MIN_CELLS, MAX_CELLS]: when the ignited area is very
+        # large the cap makes cells grow (keeps the CA fast) rather than stalling.
+        west, south, east, north = bbox
+        mid = math.radians((south + north) / 2)
+        m_w = (east - west) * 111320 * math.cos(mid)
+        m_h = (north - south) * 110540
+        gw = int(max(MIN_CELLS, min(MAX_CELLS, round(m_w / TARGET_CELL_M))))
+        gh = int(max(MIN_CELLS, min(MAX_CELLS, round(m_h / TARGET_CELL_M))))
+        return gw, gh
+
+    def _begin_region(self, ignite_lat, ignite_lon):
+        bbox = self._viewport_bbox()
+        gw, gh = self._grid_dims(bbox)
+        self._loading = True
+        self._set_status("Fetching map data… (elevation, vegetation, weather)")
+        self.config(cursor="watch")
+
+        west, south, east, north = bbox
 
         def run():
             try:
-                data = fetch_all(w, s, e, n, GRID_W, GRID_H)
-                self.after(0, lambda: self.on_done(data))
+                data = fetch_all(west, south, east, north, gw, gh)
+                self.after(0, lambda: self._region_ready(
+                    bbox, gw, gh, data, ignite_lat, ignite_lon))
             except Exception as ex:
                 msg = str(ex)
-                self.after(0, lambda: self.on_error(msg))
+                self.after(0, lambda: self._region_failed(msg))
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _region_ready(self, bbox, gw, gh, data, ignite_lat, ignite_lon):
+        self._loading = False
+        self.config(cursor="")
+        self.map_data = data
 
-# ---------------------------------------------------------------------------
-# Stage 2: Simulation view
-# ---------------------------------------------------------------------------
-
-class SimFrame(tk.Frame):
-    def __init__(self, parent, map_data, on_back):
-        super().__init__(parent)
-        self.map_data = map_data
-        self.on_back = on_back
-        self.sim = FireSimulation(GRID_W, GRID_H)
-        # Load all environmental layers into simulation
+        self.sim = FireSimulation(gw, gh)
         self.sim.load_environment(
-            slope         = map_data.slope,
-            aspect        = map_data.aspect,
-            fuel_model    = map_data.fuel_model,
-            fuel_moisture = map_data.fuel_moisture_grid,
-            wind_speed    = map_data.wind_speed,
-            wind_dir      = map_data.wind_dir,
-            cell_size_m   = map_data.cell_size_m,
+            slope         = data.slope,
+            aspect        = data.aspect,
+            fuel_model    = data.fuel_model,
+            fuel_moisture = data.fuel_moisture_grid,
+            wind_speed    = data.wind_speed,
+            wind_dir      = data.wind_dir,
+            cell_size_m   = data.cell_size_m,
         )
-        self.paused = True
-        self.speed_ms = 1000          # always 1 real second between ticks
-        self.steps_per_tick = 1       # how many 60-second steps per real second
-        self._bg_photo = None
-        self._fire_photo = None
-        self._tick_id = None
-        self._build()
-        self._draw_background()
-        self._tick()
+        self.overlay.set_region(bbox)
+        self._ignite_at(ignite_lat, ignite_lon)
+        self._set_weather_status()
 
-    def _build(self):
-        cw, ch = GRID_W * CELL, GRID_H * CELL
-        self.canvas = tk.Canvas(self, width=cw, height=ch,
-                                bg="#228B22", highlightthickness=0, cursor="crosshair")
-        self.canvas.pack()
-        self.canvas.bind("<Button-1>", self._on_click)
-        self.canvas.bind("<B1-Motion>", self._on_click)
+    def _region_failed(self, msg):
+        self._loading = False
+        self.config(cursor="")
+        self._set_status("Fetch failed")
+        messagebox.showerror("Error", msg)
 
-        # Single image item — we composite fire onto background each frame
-        self._display_photo = None
-        self._display_item = self.canvas.create_image(0, 0, anchor="nw")
+    # ------------------------------------------------------------------
+    # Ignition / simulation controls
+    # ------------------------------------------------------------------
 
-        ctrl = tk.Frame(self, bg="#333", pady=6)
-        ctrl.pack(fill=tk.X)
-        tk.Button(ctrl, text="← Back", width=8, command=self._back).pack(side=tk.LEFT, padx=6)
-        self.btn_pause = tk.Button(ctrl, text="Play", width=8, command=self._toggle_pause)
-        self.btn_pause.pack(side=tk.LEFT, padx=2)
-        tk.Button(ctrl, text="Reset", width=8, command=self._reset).pack(side=tk.LEFT, padx=2)
-
-        # Speed multiplier: how many simulated seconds pass per real second
-        tk.Label(ctrl, text="Speed:", bg="#333", fg="white").pack(side=tk.LEFT, padx=(12, 2))
-        tk.Button(ctrl, text="-", width=2, command=self._slower).pack(side=tk.LEFT)
-        self.speed_label = tk.Label(ctrl, text=self._speed_text(),
-                                    bg="#333", fg="white", width=9)
-        self.speed_label.pack(side=tk.LEFT)
-        tk.Button(ctrl, text="+", width=2, command=self._faster).pack(side=tk.LEFT)
-
-        # Elapsed simulated time display
-        self.time_label = tk.Label(ctrl, text="⏱ 0s", bg="#333",
-                                   fg="#88ff88", font=("Segoe UI", 10))
-        self.time_label.pack(side=tk.LEFT, padx=(14, 2))
-        # Weather / cell info on the right
-        md = self.map_data
-        w = md.weather
-        info = (f"Wind: {md.wind_speed:.1f} m/s @ {md.wind_dir:.0f}°  |  "
-                f"T: {w['temperature']:.0f}°C  RH: {w['humidity']:.0f}%  |  "
-                f"FM: {w['fuel_moisture']*100:.1f}%  |  "
-                f"Cell: {md.cell_size_m:.0f} m  |  Click to ignite")
-        tk.Label(ctrl, text=info, bg="#333", fg="#aaa").pack(side=tk.RIGHT, padx=10)
-
-    def _draw_background(self):
-        cw, ch = GRID_W * CELL, GRID_H * CELL
-        # background_image is already stored at canvas resolution (grid*CELL)
-        self._bg_image = self.map_data.background_image.convert("RGB")
-        self._display_photo = ImageTk.PhotoImage(self._bg_image)
-        self.canvas.itemconfig(self._display_item, image=self._display_photo)
-
-    def _on_click(self, event):
-        gx, gy = event.x // CELL, event.y // CELL
+    def _ignite_at(self, lat, lon):
+        if self.sim is None or self.overlay.bbox is None:
+            return
+        west, south, east, north = self.overlay.bbox
+        if not (west <= lon <= east and south <= lat <= north):
+            self._set_status("Outside sim area — Reset to start a fire elsewhere")
+            return
+        gx = int((lon - west) / (east - west) * self.sim.width)
+        gy = int((north - lat) / (north - south) * self.sim.height)
+        gx = max(0, min(self.sim.width - 1, gx))
+        gy = max(0, min(self.sim.height - 1, gy))
         self.sim.ignite(gx, gy)
         self.paused = False
-        self.btn_pause.config(text="Pause")
-        self._redraw_fire()  # show ignition point immediately
+        self.btn_pause.config(text="⏸ Pause")
+        self.overlay.refresh_content(self.sim)
+
+    def _toggle_ignite(self):
+        self.ignite_mode = not self.ignite_mode
+        if self.ignite_mode:
+            self.canvas.config(cursor="crosshair")
+            self.btn_ignite.config(relief=tk.SUNKEN, bg=self.IGNITE_ON)
+            self._set_status("Ignite armed — click the map to light a fire")
+        else:
+            self.canvas.config(cursor="fleur")
+            self.btn_ignite.config(relief=tk.RAISED, bg=self.BTN_BG)
+            self._set_weather_status()
 
     def _toggle_pause(self):
+        if self.sim is None:
+            self._set_status("Nothing to play — ignite a fire first")
+            return
         self.paused = not self.paused
-        self.btn_pause.config(text="Play" if self.paused else "Pause")
+        self.btn_pause.config(text="▶ Play" if self.paused else "⏸ Pause")
         if not self.paused:
-            self._redraw_fire()
+            self.overlay.refresh_content(self.sim)
 
     def _reset(self):
-        self.sim.reset()
+        if self.sim is not None:
+            self.sim.reset()
+        self.sim = None
+        self.map_data = None
+        self.overlay.clear()
         self.paused = True
-        self.btn_pause.config(text="Play")
+        self.btn_pause.config(text="▶ Play")
         self.time_label.config(text="⏱ 0s")
-        # Restore plain background
-        self._display_photo = ImageTk.PhotoImage(self._bg_image)
-        self.canvas.itemconfig(self._display_item, image=self._display_photo)
-    def _back(self):
-        if self._tick_id:
-            self.after_cancel(self._tick_id)
-        self.on_back()
+        self._set_status("Reset — arm 🔥 Ignite and click to start a new fire")
 
     def _slower(self):
-        steps = [1, 2, 5, 10, 30, 60]
-        idx = next((i for i, s in enumerate(steps) if s >= self.steps_per_tick), len(steps)-1)
-        self.steps_per_tick = steps[max(0, idx - 1)]
+        idx = next((i for i, s in enumerate(SPEED_STEPS)
+                    if s >= self.steps_per_tick), len(SPEED_STEPS) - 1)
+        self.steps_per_tick = SPEED_STEPS[max(0, idx - 1)]
         self.speed_label.config(text=self._speed_text())
 
     def _faster(self):
-        steps = [1, 2, 5, 10, 30, 60]
-        idx = next((i for i, s in enumerate(steps) if s >= self.steps_per_tick), 0)
-        self.steps_per_tick = steps[min(len(steps)-1, idx + 1)]
+        idx = next((i for i, s in enumerate(SPEED_STEPS)
+                    if s >= self.steps_per_tick), 0)
+        self.steps_per_tick = SPEED_STEPS[min(len(SPEED_STEPS) - 1, idx + 1)]
         self.speed_label.config(text=self._speed_text())
 
     def _speed_text(self):
-        mins = self.steps_per_tick
-        if mins < 60:
-            return f"{mins} min/s"
-        else:
-            return f"{mins//60} h/s"
+        m = self.steps_per_tick
+        return f"{m} min/s" if m < 60 else f"{m // 60} h/s"
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     def _tick(self):
-        if not self.paused:
+        if self.sim is not None and not self.paused and self.sim.running:
             for _ in range(self.steps_per_tick):
                 self.sim.step(dt_seconds=60)
                 if not self.sim.running:
                     break
-            self._redraw_fire()
+            self.overlay.refresh_content(self.sim)
             self.time_label.config(text=f"⏱ {self.sim.elapsed_str()}")
-            if not self.sim.running:
-                print("[tick] simulation stopped (no burning cells)")
         self._tick_id = self.after(1000, self._tick)
 
-    def _redraw_fire(self):
-        import numpy as np
-        grid_arr = np.array(self.sim.grid, dtype=np.uint8)  # (H, W)
+    # ------------------------------------------------------------------
+    # Status helpers
+    # ------------------------------------------------------------------
 
-        # Start from background RGB
-        frame = np.array(self._bg_image, dtype=np.uint8)  # (ch, cw, 3)
+    def _set_status(self, text):
+        self.status_label.config(text=text)
 
-        # Build small (GRID_H, GRID_W, 3) fire colour array
-        fire_rgb = np.zeros((GRID_H, GRID_W, 3), dtype=np.uint8)
-        fire_rgb[grid_arr == BURNING] = FIRE_COLORS[BURNING]
-        fire_rgb[grid_arr == BURNED]  = FIRE_COLORS[BURNED]
-        fire_mask = (grid_arr == BURNING) | (grid_arr == BURNED)  # (H, W) bool
-
-        # Scale up fire layers to full canvas size
-        fire_rgb_big  = np.repeat(np.repeat(fire_rgb,  CELL, axis=0), CELL, axis=1)
-        fire_mask_big = np.repeat(np.repeat(fire_mask, CELL, axis=0), CELL, axis=1)
-
-        # Composite: replace background pixels where fire exists
-        frame[fire_mask_big] = fire_rgb_big[fire_mask_big]
-
-        img = Image.fromarray(frame, mode="RGB")
-        self._display_photo = ImageTk.PhotoImage(img)
-        self.canvas.itemconfig(self._display_item, image=self._display_photo)
-
-
-# ---------------------------------------------------------------------------
-# Root app
-# ---------------------------------------------------------------------------
-
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Fire Spread Simulator")
-        self.resizable(False, False)
-        self._frame = None
-        self._show_overview()
-
-    def _show_overview(self):
-        self._switch(OverviewFrame(self, on_bbox_selected=self._on_bbox))
-
-    def _on_bbox(self, west, south, east, north):
-        self._switch(LoadingFrame(self, (west, south, east, north),
-                                  on_done=self._on_data_ready,
-                                  on_error=self._on_error))
-
-    def _on_data_ready(self, map_data):
-        self._switch(SimFrame(self, map_data, on_back=self._show_overview))
-
-    def _on_error(self, msg):
-        messagebox.showerror("Error", msg)
-        self._show_overview()
-
-    def _switch(self, frame):
-        if self._frame:
-            self._frame.destroy()
-        self._frame = frame
-        frame.pack(fill=tk.BOTH, expand=True)
+    def _set_weather_status(self):
+        if self.map_data is None:
+            self._set_status("Arm 🔥 Ignite, then click the map to start a fire")
+            return
+        md = self.map_data
+        w = md.weather
+        self._set_status(
+            f"Wind {md.wind_speed:.1f} m/s @ {md.wind_dir:.0f}°  |  "
+            f"T {w['temperature']:.0f}°C  RH {w['humidity']:.0f}%  |  "
+            f"FM {w['fuel_moisture'] * 100:.1f}%  |  Cell {md.cell_size_m:.0f} m")
 
 
 if __name__ == "__main__":

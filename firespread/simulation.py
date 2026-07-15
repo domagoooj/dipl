@@ -4,11 +4,12 @@ CA-Rothermel fire spread simulation.
 Time model:
   - The simulation tracks elapsed simulated time in seconds.
   - Each call to step(dt_seconds) advances the simulation by dt_seconds of
-    simulated time. The Rothermel ROS (m/min) is converted to a per-second
+    simulated time. The Rothermel ROS (m/min) is converted to a per-step
     ignition probability using the actual dt.
-  - The UI calls step() once per real-world second, passing dt = speed_factor
-    so that speed_factor=1 means real-time, speed_factor=60 means 1 minute
-    of fire time per real second, etc.
+  - The UI's animation loop ticks once per real-world second and calls
+    step(dt_seconds=60) a number of times (steps_per_tick), so the fire
+    advances by steps_per_tick simulated minutes per real second. Raising
+    steps_per_tick speeds up the passage of simulated time.
 """
 
 import random

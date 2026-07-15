@@ -1,8 +1,13 @@
 """
 Slippy map widget for tkinter.
-- Left drag: pan
-- Scroll wheel: zoom
-- Shift + left drag: draw bounding box selection
+
+- Left drag        : pan
+- Scroll wheel     : zoom (keeps point under cursor fixed)
+- Tap (no drag)    : reported through on_click(lat, lon)
+
+The map fills its canvas and supports live resizing via resize(). A separate
+overlay (the fire simulation) is drawn on top of the same canvas and kept in
+sync through the on_redraw hook, which fires after every tile redraw.
 """
 
 import io
@@ -57,7 +62,8 @@ class SlippyMap:
 
     Usage:
         sm = SlippyMap(canvas, width, height, lat=45.8, lon=15.97, zoom=11)
-        sm.on_bbox = lambda w,s,e,n: ...   # called when Shift-drag completes
+        sm.on_click  = lambda lat, lon: ...   # tap without dragging
+        sm.on_redraw = lambda: ...            # after every tile redraw
     """
 
     def __init__(self, canvas, width, height, lat=45.8, lon=15.97, zoom=11):
@@ -65,8 +71,9 @@ class SlippyMap:
         self.width = width
         self.height = height
         self.zoom = zoom
-        self.on_bbox = None          # callback(west, south, east, north)
+        self.on_click = None         # callback(lat, lon) on a tap (no drag)
         self.on_status = None        # callback(str)
+        self.on_redraw = None        # callback() after each tile redraw
 
         self._cache = TileCache()
         self._pending = set()        # tiles currently being fetched
@@ -77,12 +84,9 @@ class SlippyMap:
         self._cx = cx  # tile-space centre x
         self._cy = cy  # tile-space centre y
 
-        # Pan state
+        # Pan / tap state
         self._pan_start = None
-
-        # Bbox selection state
-        self._sel_start = None   # canvas pixel
-        self._sel_rect = None    # canvas item id
+        self._moved = False
 
         # Tile image items on canvas (key -> canvas item id)
         self._tile_items = {}
@@ -95,10 +99,19 @@ class SlippyMap:
     # ------------------------------------------------------------------
 
     def center_latlon(self):
-        lat, lon = tile2deg(self._cx, self._cy, self.zoom)
-        return lat, lon
+        return tile2deg(self._cx, self._cy, self.zoom)
 
     def redraw(self):
+        self._draw_tiles()
+
+    def resize(self, width, height):
+        """Update the widget size (called on canvas <Configure>)."""
+        if width <= 1 or height <= 1:
+            return
+        if width == self.width and height == self.height:
+            return
+        self.width = width
+        self.height = height
         self._draw_tiles()
 
     # ------------------------------------------------------------------
@@ -106,20 +119,25 @@ class SlippyMap:
     # ------------------------------------------------------------------
 
     def _canvas_to_tile(self, cx_px, cy_px):
-        """Canvas pixel → fractional tile coord."""
+        """Canvas pixel -> fractional tile coord."""
         tx = self._cx + (cx_px - self.width / 2) / TILE_SIZE
         ty = self._cy + (cy_px - self.height / 2) / TILE_SIZE
         return tx, ty
 
     def _tile_to_canvas(self, tx, ty):
-        """Fractional tile coord → canvas pixel."""
+        """Fractional tile coord -> canvas pixel."""
         cx_px = (tx - self._cx) * TILE_SIZE + self.width / 2
         cy_px = (ty - self._cy) * TILE_SIZE + self.height / 2
         return cx_px, cy_px
 
-    def _canvas_to_latlon(self, cx_px, cy_px):
+    def canvas_to_latlon(self, cx_px, cy_px):
         tx, ty = self._canvas_to_tile(cx_px, cy_px)
         return tile2deg(tx, ty, self.zoom)
+
+    def latlon_to_canvas(self, lat, lon):
+        """Geographic coordinate -> canvas pixel (inverse of canvas_to_latlon)."""
+        tx, ty = deg2tile_f(lat, lon, self.zoom)
+        return self._tile_to_canvas(tx, ty)
 
     # ------------------------------------------------------------------
     # Tile drawing
@@ -133,7 +151,6 @@ class SlippyMap:
         ty_max = int(self._cy + (self.height / 2) / TILE_SIZE) + 1
 
         n_tiles = 2 ** self.zoom
-        needed = set()
 
         for tx in range(tx_min, tx_max + 1):
             for ty in range(ty_min, ty_max + 1):
@@ -141,7 +158,6 @@ class SlippyMap:
                     continue
                 wtx = tx % n_tiles  # wrap longitude
                 key = (self.zoom, wtx, ty)
-                needed.add(key)
 
                 img = self._cache.get(key)
                 if img is None:
@@ -161,14 +177,14 @@ class SlippyMap:
                     self.canvas._tile_photos[item_key] = photo
                     self._tile_items[item_key] = item
 
-        # Remove tiles no longer visible
+        # Remove tiles from other zoom levels
         stale = [k for k in self._tile_items if k[2] != self.zoom]
         for k in stale:
             self.canvas.delete(self._tile_items.pop(k))
 
-        # Keep selection rect on top
-        if self._sel_rect:
-            self.canvas.tag_raise(self._sel_rect)
+        # Let the overlay (fire) reposition itself on top of the fresh tiles
+        if self.on_redraw:
+            self.on_redraw()
 
     def _fetch_tile(self, key):
         with self._lock:
@@ -207,58 +223,35 @@ class SlippyMap:
         c.bind("<Button-4>",        self._on_scroll)       # Linux scroll up
         c.bind("<Button-5>",        self._on_scroll)       # Linux scroll down
 
-    def _is_shift(self, event):
-        return bool(event.state & 0x0001)
-
     def _on_press(self, event):
-        if self._is_shift(event):
-            self._sel_start = (event.x, event.y)
-            if self._sel_rect:
-                self.canvas.delete(self._sel_rect)
-                self._sel_rect = None
-        else:
-            self._pan_start = (event.x, event.y, self._cx, self._cy)
+        self._pan_start = (event.x, event.y, self._cx, self._cy)
+        self._moved = False
 
     def _on_drag(self, event):
-        if self._is_shift(event) and self._sel_start:
-            x0, y0 = self._sel_start
-            if self._sel_rect:
-                self.canvas.delete(self._sel_rect)
-            self._sel_rect = self.canvas.create_rectangle(
-                x0, y0, event.x, event.y,
-                outline="#FF4500", width=2, dash=(5, 3), tags="selection"
-            )
-        elif self._pan_start:
-            sx, sy, ocx, ocy = self._pan_start
-            dx = (event.x - sx) / TILE_SIZE
-            dy = (event.y - sy) / TILE_SIZE
-            self._cx = ocx - dx
-            self._cy = ocy - dy
-            self._draw_tiles()
+        if not self._pan_start:
+            return
+        sx, sy, ocx, ocy = self._pan_start
+        if abs(event.x - sx) > 3 or abs(event.y - sy) > 3:
+            self._moved = True
+        dx = (event.x - sx) / TILE_SIZE
+        dy = (event.y - sy) / TILE_SIZE
+        self._cx = ocx - dx
+        self._cy = ocy - dy
+        self._draw_tiles()
 
     def _on_release(self, event):
-        if self._is_shift(event) and self._sel_start:
-            x0, y0 = self._sel_start
-            x1, y1 = event.x, event.y
-            self._sel_start = None
-
-            if abs(x1 - x0) < 10 or abs(y1 - y0) < 10:
-                return  # too small
-
-            # Convert to lat/lon
-            lat0, lon0 = self._canvas_to_latlon(min(x0, x1), min(y0, y1))
-            lat1, lon1 = self._canvas_to_latlon(max(x0, x1), max(y0, y1))
-            west, east = min(lon0, lon1), max(lon0, lon1)
-            south, north = min(lat0, lat1), max(lat0, lat1)
-
-            if self.on_bbox:
-                self.on_bbox(west, south, east, north)
-        else:
-            self._pan_start = None
+        was_pan = self._pan_start is not None
+        moved = self._moved
+        self._pan_start = None
+        self._moved = False
+        # A tap (press + release without meaningful movement) is a click.
+        if was_pan and not moved and self.on_click:
+            lat, lon = self.canvas_to_latlon(event.x, event.y)
+            self.on_click(lat, lon)
 
     def _on_scroll(self, event):
         # Determine zoom direction
-        if event.num == 4 or event.delta > 0:
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
             delta = 1
         else:
             delta = -1
@@ -269,7 +262,7 @@ class SlippyMap:
 
         # Keep the point under the cursor fixed
         mx, my = event.x, event.y
-        lat, lon = self._canvas_to_latlon(mx, my)
+        lat, lon = self.canvas_to_latlon(mx, my)
 
         self.zoom = new_zoom
         # Clear old tile items (zoom changed)
@@ -279,7 +272,7 @@ class SlippyMap:
         if hasattr(self.canvas, '_tile_photos'):
             self.canvas._tile_photos.clear()
 
-        # Recentre so the cursor point stays under mouse
+        # Recentre so the cursor point stays under the mouse
         cx_new, cy_new = deg2tile_f(lat, lon, new_zoom)
         self._cx = cx_new + (self.width / 2 - mx) / TILE_SIZE
         self._cy = cy_new + (self.height / 2 - my) / TILE_SIZE
